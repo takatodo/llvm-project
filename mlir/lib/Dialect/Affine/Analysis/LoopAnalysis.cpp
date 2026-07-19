@@ -18,6 +18,7 @@
 #include "mlir/Dialect/Affine/Analysis/NestedMatcher.h"
 #include "mlir/Dialect/Affine/Analysis/Utils.h"
 #include "mlir/Dialect/Affine/IR/AffineValueMap.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/Support/MathExtras.h"
 
 #include "llvm/Support/Debug.h"
@@ -457,15 +458,134 @@ bool mlir::affine::isVectorizableLoopBody(
   return isVectorizableLoopBodyWithOpCond(loop, nullptr, vectorTransferMatcher);
 }
 
-/// Checks whether SSA dominance would be violated if a for op's body
-/// operations are shifted by the specified shifts. This method checks if a
-/// 'def' and all its uses have the same shift factor.
-// TODO: extend this to check for memory-based dependence violation when we have
-// the support.
-bool mlir::affine::isOpwiseShiftValid(AffineForOp forOp,
-                                      ArrayRef<uint64_t> shifts) {
+namespace {
+
+struct ShiftedAffineAccess {
+  MemRefAccess access;
+  uint64_t shift;
+};
+
+/// Returns whether the relative shift of `src` and `dst` preserves every
+/// dependence from `src` to `dst`.
+static bool
+isMemoryDependencePreserved(AffineForOp forOp, const ShiftedAffineAccess &src,
+                            const ShiftedAffineAccess &dst,
+                            llvm::function_ref<bool(Value, Value)> mayAlias) {
+  assert(src.shift > dst.shift && "expected a potentially reordered pair");
+  if (src.access.memref != dst.access.memref) {
+    if (!mayAlias(src.access.memref, dst.access.memref))
+      return true;
+    return !isa<AffineWriteOpInterface>(src.access.opInst) &&
+           !isa<AffineWriteOpInterface>(dst.access.opInst);
+  }
+
+  uint64_t shiftDistance = llvm::SaturatingMultiply(
+      src.shift - dst.shift, static_cast<uint64_t>(forOp.getStepAsInt()));
+  unsigned forDepth = getNestingDepth(forOp) + 1;
+  unsigned numCommonLoops =
+      getNumCommonSurroundingLoops(*src.access.opInst, *dst.access.opInst);
+
+  // Check dependences carried by `forOp`, any shared inner loop, and the
+  // innermost common loop body. Dependences outside `forOp` are unaffected.
+  for (unsigned depth = forDepth; depth <= numCommonLoops + 1; ++depth) {
+    SmallVector<DependenceComponent, 2> depComps;
+    DependenceResult result = checkMemrefAccessDependence(
+        src.access, dst.access, depth, /*dependenceConstraints=*/nullptr,
+        &depComps);
+    if (result.value == DependenceResult::Failure)
+      return false;
+    if (noDependence(result))
+      continue;
+
+    auto forComp =
+        llvm::find_if(depComps, [&](const DependenceComponent &comp) {
+          return comp.op == forOp.getOperation();
+        });
+    if (forComp == depComps.end() || !forComp->lb || *forComp->lb <= 0 ||
+        static_cast<uint64_t>(*forComp->lb) <= shiftDistance)
+      return false;
+  }
+  return true;
+}
+
+static bool
+areMemoryDependencesPreserved(AffineForOp forOp, ArrayRef<uint64_t> shifts,
+                              llvm::function_ref<bool(Value, Value)> mayAlias) {
+  SmallVector<ShiftedAffineAccess> accesses;
+  unsigned position = 0;
+  for (Operation &op : forOp.getBody()->getOperations()) {
+    uint64_t shift = shifts[position++];
+    op.walk([&](Operation *nestedOp) {
+      if (isa<AffineReadOpInterface, AffineWriteOpInterface>(nestedOp))
+        accesses.push_back({MemRefAccess(nestedOp), shift});
+    });
+  }
+
+  for (const ShiftedAffineAccess &src : accesses)
+    for (const ShiftedAffineAccess &dst : accesses)
+      if (src.shift > dst.shift &&
+          !isMemoryDependencePreserved(forOp, src, dst, mayAlias))
+        return false;
+  return true;
+}
+
+/// Returns whether operations with unsupported memory effects may be reordered
+/// relative to another memory operation. Precise Affine accesses are handled
+/// separately above.
+static bool areUnsupportedMemoryEffectsPreserved(AffineForOp forOp,
+                                                 ArrayRef<uint64_t> shifts) {
+  struct EffectSummary {
+    uint64_t shift;
+    bool hasMemoryEffect = false;
+    bool hasUnsupportedEffect = false;
+  };
+
+  SmallVector<EffectSummary> summaries;
+  summaries.reserve(shifts.size());
+  for (auto [op, shift] : llvm::zip(forOp.getBody()->getOperations(), shifts)) {
+    summaries.push_back({shift, false, false});
+    EffectSummary &summary = summaries.back();
+    op.walk([&](Operation *nestedOp) {
+      if (isa<AffineReadOpInterface, AffineWriteOpInterface>(nestedOp)) {
+        summary.hasMemoryEffect = true;
+        return;
+      }
+      if (auto memoryEffects = dyn_cast<MemoryEffectOpInterface>(nestedOp)) {
+        SmallVector<MemoryEffects::EffectInstance> effects;
+        memoryEffects.getEffects(effects);
+        if (!effects.empty()) {
+          summary.hasMemoryEffect = true;
+          summary.hasUnsupportedEffect = true;
+        }
+        return;
+      }
+      if (!nestedOp->hasTrait<OpTrait::HasRecursiveMemoryEffects>()) {
+        summary.hasMemoryEffect = true;
+        summary.hasUnsupportedEffect = true;
+      }
+    });
+  }
+
+  for (const EffectSummary &lhs : summaries)
+    for (const EffectSummary &rhs : summaries)
+      if (lhs.shift != rhs.shift &&
+          ((lhs.hasUnsupportedEffect && rhs.hasMemoryEffect) ||
+           (lhs.hasMemoryEffect && rhs.hasUnsupportedEffect)))
+        return false;
+  return true;
+}
+
+} // namespace
+
+static bool
+isOpwiseShiftValidImpl(AffineForOp forOp, ArrayRef<uint64_t> shifts,
+                       llvm::function_ref<bool(Value, Value)> mayAlias,
+                       bool checkUnsupportedMemoryEffects) {
   auto *forBody = forOp.getBody();
   assert(shifts.size() == forBody->getOperations().size());
+
+  if (forOp.getNumIterOperands() != 0)
+    return false;
 
   // Work backwards over the body of the block so that the shift of a use's
   // ancestor operation in the block gets recorded before it's looked up.
@@ -496,7 +616,23 @@ bool mlir::affine::isOpwiseShiftValid(AffineForOp forOp,
       }
     }
   }
-  return true;
+  return (!checkUnsupportedMemoryEffects ||
+          areUnsupportedMemoryEffectsPreserved(forOp, shifts)) &&
+         areMemoryDependencesPreserved(forOp, shifts, mayAlias);
+}
+
+bool mlir::affine::isOpwiseShiftValid(AffineForOp forOp,
+                                      ArrayRef<uint64_t> shifts) {
+  return isOpwiseShiftValidImpl(
+      forOp, shifts, [](Value, Value) { return false; },
+      /*checkUnsupportedMemoryEffects=*/false);
+}
+
+bool mlir::affine::isOpwiseShiftValid(
+    AffineForOp forOp, ArrayRef<uint64_t> shifts,
+    llvm::function_ref<bool(Value, Value)> mayAlias) {
+  return isOpwiseShiftValidImpl(forOp, shifts, mayAlias,
+                                /*checkUnsupportedMemoryEffects=*/true);
 }
 
 bool mlir::affine::isTilingValid(ArrayRef<AffineForOp> loops) {

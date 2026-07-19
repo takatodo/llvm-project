@@ -15,6 +15,7 @@
 
 #include "mlir/Support/LLVM.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include <optional>
 
 namespace mlir {
@@ -103,12 +104,22 @@ bool isVectorizableLoopBody(AffineForOp loop,
 bool isVectorizableLoopBody(AffineForOp loop, int *memRefDim,
                             NestedPattern &vectorTransferMatcher);
 
-/// Checks where SSA dominance would be violated if a for op's body
-/// operations are shifted by the specified shifts. This method checks if a
-/// 'def' and all its uses have the same shift factor.
-// TODO: extend this to check for memory-based dependence violation when we have
-// the support.
+/// Checks whether shifting a for op's body operations by the specified shifts
+/// would violate SSA dominance or an affine memory dependence between accesses
+/// using the same memref SSA value. This does not model aliases between
+/// distinct memref SSA values or non-affine memory effects. Loops with iter
+/// operands are rejected conservatively because their loop-carried SSA
+/// dependences are not modeled.
 bool isOpwiseShiftValid(AffineForOp forOp, ArrayRef<uint64_t> shifts);
+
+/// As above, additionally using `mayAlias` to check accesses through distinct
+/// memref SSA values. `mayAlias` must return false only when the values are
+/// known not to alias. A potentially reordered, may-alias pair involving a
+/// write is rejected because Affine dependence analysis cannot relate their
+/// access functions. Reordering involving unsupported non-Affine memory
+/// effects is also rejected conservatively.
+bool isOpwiseShiftValid(AffineForOp forOp, ArrayRef<uint64_t> shifts,
+                        llvm::function_ref<bool(Value, Value)> mayAlias);
 
 /// Checks whether hyper-rectangular loop tiling of the nest represented by
 /// `loops` is valid. The validity condition is from Irigoin and Triolet,

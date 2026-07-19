@@ -9,10 +9,13 @@
 // This file implements a pass to test affine access analysis utilities.
 //
 //===----------------------------------------------------------------------===//
+#include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/Utils.h"
 #include "mlir/Dialect/Affine/LoopFusionUtils.h"
+#include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Pass/Pass.h"
 
 #define PASS_NAME "test-affine-access-analysis"
@@ -50,9 +53,44 @@ gatherLoadsAndStores(AffineForOp forOp,
 void TestAccessAnalysis::runOnOperation() {
   SmallVector<Operation *> loadStores;
   SmallVector<AffineForOp> enclosingOps;
+  AliasAnalysis &aliasAnalysis = getAnalysis<AliasAnalysis>();
+  auto mayAlias = [&](Value lhs, Value rhs) {
+    return !aliasAnalysis.alias(lhs, rhs).isNo();
+  };
   // Go over all top-level affine.for ops and test each contained affine
   // access's contiguity along every surrounding loop IV.
   for (auto forOp : getOperation().getOps<AffineForOp>()) {
+    if (auto shiftAttr =
+            forOp->getAttrOfType<DenseI64ArrayAttr>("test.shifts")) {
+      ArrayRef<int64_t> shiftValues = shiftAttr.asArrayRef();
+      if (shiftValues.size() != forOp.getBody()->getOperations().size() ||
+          llvm::any_of(shiftValues, [](int64_t shift) { return shift < 0; })) {
+        forOp.emitError(
+            "expected one non-negative shift per loop body operation");
+        signalPassFailure();
+        return;
+      }
+
+      SmallVector<uint64_t> shifts(shiftValues.begin(), shiftValues.end());
+      bool valid = isOpwiseShiftValid(forOp, shifts, mayAlias);
+      forOp.emitRemark(valid ? "valid operation shifts"
+                             : "invalid operation shifts");
+      if (forOp->hasAttr("test.apply_shifts")) {
+        if (!valid) {
+          forOp.emitError("cannot apply invalid operation shifts");
+          signalPassFailure();
+          return;
+        }
+        if (failed(affineForOpBodySkew(forOp, shifts))) {
+          signalPassFailure();
+          return;
+        }
+        // Applying the skew erases `forOp` and invalidates the loop iterator.
+        return;
+      }
+      continue;
+    }
+
     loadStores.clear();
     gatherLoadsAndStores(forOp, loadStores);
     for (Operation *memOp : loadStores) {
