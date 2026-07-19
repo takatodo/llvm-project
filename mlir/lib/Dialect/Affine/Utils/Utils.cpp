@@ -13,6 +13,7 @@
 
 #include "mlir/Dialect/Affine/Utils.h"
 
+#include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/Utils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/IR/AffineValueMap.h"
@@ -899,6 +900,161 @@ static void forwardStoreToLoad(
   loadOpsToErase.push_back(loadOp);
 }
 
+/// Returns whether the access made by `storeOp` in one iteration is
+/// identically the access made by `loadOp` in the following iteration.
+static bool accessesMatchOneIterationApart(AffineStoreOp storeOp,
+                                           AffineLoadOp loadOp,
+                                           AffineForOp forOp) {
+  AffineValueMap storeAccess, loadAccess;
+  MemRefAccess(storeOp).getAccessMap(&storeAccess);
+  MemRefAccess(loadOp).getAccessMap(&loadAccess);
+
+  AffineMap loadMap = loadAccess.getAffineMap();
+  MLIRContext *context = forOp.getContext();
+  SmallVector<AffineExpr> dimReplacements, symbolReplacements;
+  for (unsigned i = 0; i < loadMap.getNumDims(); ++i)
+    dimReplacements.push_back(getAffineDimExpr(i, context));
+  for (unsigned i = 0; i < loadMap.getNumSymbols(); ++i)
+    symbolReplacements.push_back(getAffineSymbolExpr(i, context));
+
+  for (auto [index, operand] : llvm::enumerate(loadAccess.getOperands())) {
+    if (operand != forOp.getInductionVar())
+      continue;
+    if (index < loadMap.getNumDims())
+      dimReplacements[index] = dimReplacements[index] + forOp.getStepAsInt();
+    else
+      symbolReplacements[index - loadMap.getNumDims()] =
+          symbolReplacements[index - loadMap.getNumDims()] +
+          forOp.getStepAsInt();
+  }
+
+  AffineMap shiftedLoadMap = loadMap.replaceDimsAndSymbols(
+      dimReplacements, symbolReplacements, loadMap.getNumDims(),
+      loadMap.getNumSymbols());
+  return storeAccess ==
+         AffineValueMap(shiftedLoadMap, loadAccess.getOperands());
+}
+
+/// Returns whether `storeOp` produces the value read by `loadOp` in the
+/// following iteration of `forOp`.
+static bool hasOneIterationForwardingRelation(AffineStoreOp storeOp,
+                                              AffineLoadOp loadOp,
+                                              AffineForOp forOp) {
+  if (!accessesMatchOneIterationApart(storeOp, loadOp, forOp))
+    return false;
+
+  // Moving the first load to the loop preheader is only valid when the
+  // candidate store does not also reach that load in the same iteration.
+  unsigned numCommonLoops = getNumCommonSurroundingLoops(*storeOp, *loadOp);
+  DependenceResult result = checkMemrefAccessDependence(
+      MemRefAccess(storeOp), MemRefAccess(loadOp), numCommonLoops + 1);
+  return noDependence(result);
+}
+
+/// Returns whether `storeOp` is the only operation in `forOp` that may write
+/// the memref read by `loadOp`.
+static bool
+hasNoOtherMayAliasWriter(AffineForOp forOp, AffineStoreOp storeOp,
+                         AffineLoadOp loadOp,
+                         llvm::function_ref<bool(Value, Value)> mayAlias) {
+  for (Operation &op : forOp.getBody()->without_terminator()) {
+    if (&op == storeOp.getOperation())
+      continue;
+    std::optional<SmallVector<MemoryEffects::EffectInstance>> effects =
+        getEffectsRecursively(&op);
+    if (!effects)
+      return false;
+    for (const MemoryEffects::EffectInstance &effect : *effects) {
+      if (!isa<MemoryEffects::Write>(effect.getEffect()))
+        continue;
+      Value writtenValue = effect.getValue();
+      if (!writtenValue || mayAlias(writtenValue, loadOp.getMemRef()))
+        return false;
+    }
+  }
+  return true;
+}
+
+/// Forward a load from the preceding loop iteration through an affine.for
+/// iter_arg. This deliberately handles only a one-iteration access recurrence
+/// with one unconditional, top-level writer.
+static LogicalResult
+forwardLoopCarriedStoreToLoad(AffineLoadOp loadOp,
+                              llvm::function_ref<bool(Value, Value)> mayAlias) {
+  auto forOp = dyn_cast<AffineForOp>(loadOp->getParentOp());
+  if (!forOp || forOp.getLowerBoundMap().getNumResults() != 1 ||
+      !forOp.isDefinedOutsideOfLoop(loadOp.getMemRef()))
+    return failure();
+  std::optional<APInt> tripCount = forOp.getStaticTripCount();
+  if (!tripCount || tripCount->ult(2))
+    return failure();
+
+  AffineStoreOp storeOp;
+  for (Operation &op : forOp.getBody()->without_terminator()) {
+    auto candidate = dyn_cast<AffineStoreOp>(op);
+    if (!candidate || candidate.getMemRef() != loadOp.getMemRef() ||
+        candidate.getValueToStore().getType() != loadOp.getType() ||
+        !hasOneIterationForwardingRelation(candidate, loadOp, forOp))
+      continue;
+    if (storeOp)
+      return failure();
+    storeOp = candidate;
+  }
+  if (!storeOp || !hasNoOtherMayAliasWriter(forOp, storeOp, loadOp, mayAlias))
+    return failure();
+
+  // Fully compose the initial access before moving it to the preheader. Any
+  // remaining operand must either be the loop IV or be defined outside.
+  AffineMap initialMap = loadOp.getAffineMap();
+  SmallVector<Value> initialOperands(loadOp.getMapOperands());
+  fullyComposeAffineMapAndOperands(&initialMap, &initialOperands);
+  initialMap = simplifyAffineMap(initialMap);
+  canonicalizeMapAndOperands(&initialMap, &initialOperands);
+  Value inductionVar = forOp.getInductionVar();
+  if (llvm::any_of(initialOperands, [&](Value operand) {
+        return operand != inductionVar &&
+               !forOp.isDefinedOutsideOfLoop(operand);
+      }))
+    return failure();
+
+  IRRewriter rewriter(forOp.getContext());
+  rewriter.setInsertionPoint(forOp);
+  Value lowerBound;
+  if (forOp.hasConstantLowerBound())
+    lowerBound = arith::ConstantIndexOp::create(rewriter, forOp.getLoc(),
+                                                forOp.getConstantLowerBound());
+  else
+    lowerBound = AffineApplyOp::create(rewriter, forOp.getLoc(),
+                                       forOp.getLowerBoundMap(),
+                                       forOp.getLowerBoundOperands());
+  llvm::replace(initialOperands, inductionVar, lowerBound);
+  fullyComposeAffineMapAndOperands(&initialMap, &initialOperands);
+  initialMap = simplifyAffineMap(initialMap);
+  canonicalizeMapAndOperands(&initialMap, &initialOperands);
+  auto initialLoad =
+      AffineLoadOp::create(rewriter, loadOp.getLoc(), loadOp.getMemRef(),
+                           initialMap, initialOperands);
+  if (lowerBound.use_empty())
+    rewriter.eraseOp(lowerBound.getDefiningOp());
+
+  BlockArgument carriedValue;
+  FailureOr<LoopLikeOpInterface> newLoop = forOp.replaceWithAdditionalYields(
+      rewriter, initialLoad.getResult(),
+      /*replaceInitOperandUsesInLoop=*/false,
+      [&](OpBuilder &, Location, ArrayRef<BlockArgument> newArgs) {
+        carriedValue = newArgs.front();
+        return SmallVector<Value>{storeOp.getValueToStore()};
+      });
+  if (failed(newLoop)) {
+    rewriter.eraseOp(initialLoad);
+    return failure();
+  }
+
+  loadOp.getResult().replaceAllUsesWith(carriedValue);
+  rewriter.eraseOp(loadOp);
+  return success();
+}
+
 template bool
 mlir::affine::hasNoInterveningEffect<mlir::MemoryEffects::Read,
                                      affine::AffineReadOpInterface>(
@@ -1043,8 +1199,8 @@ static void loadCSE(AffineReadOpInterface loadA,
 // don't reason about loops that are guaranteed to execute at least once or
 // multiple sources to forward from.
 //
-// TODO: more forwarding can be done when support for
-// loop/conditional live-out SSA values is available.
+// TODO: more forwarding can be done for conditional live-out SSA values and
+// loop-carried dependences with distance greater than one.
 // TODO: do general dead store elimination for memref's. This pass
 // currently only eliminates the stores only if no other loads/uses (other
 // than dealloc) remain.
@@ -1109,6 +1265,39 @@ void mlir::affine::affineScalarReplace(func::FuncOp f, DominanceInfo &domInfo,
   });
   for (auto *op : opsToErase)
     op->erase();
+
+  // Forward one-iteration loop-carried stores one at a time because adding an
+  // iter_arg replaces the containing affine.for op.
+  bool forwardedLoopCarriedLoad = false;
+  while (true) {
+    SmallVector<AffineLoadOp> loads;
+    f.walk([&](AffineLoadOp loadOp) { loads.push_back(loadOp); });
+    bool changed = false;
+    for (AffineLoadOp loadOp : loads) {
+      if (succeeded(forwardLoopCarriedStoreToLoad(loadOp, mayAlias))) {
+        changed = true;
+        forwardedLoopCarriedLoad = true;
+        break;
+      }
+    }
+    if (!changed)
+      break;
+  }
+
+  // A newly materialized preheader load may itself be forwardable from a
+  // dominating prologue store. Recompute dominance after replacing loops and
+  // run the ordinary forwarding once more.
+  if (forwardedLoopCarriedLoad) {
+    DominanceInfo updatedDomInfo(f);
+    SmallVector<Operation *> newOpsToErase;
+    SmallPtrSet<Value, 4> newMemrefsToErase;
+    f.walk([&](AffineReadOpInterface loadOp) {
+      forwardStoreToLoad(loadOp, newOpsToErase, newMemrefsToErase,
+                         updatedDomInfo, mayAlias);
+    });
+    for (Operation *op : newOpsToErase)
+      op->erase();
+  }
 }
 
 // Checks if `op` is non dereferencing.

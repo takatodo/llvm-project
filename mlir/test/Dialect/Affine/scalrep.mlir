@@ -1,4 +1,7 @@
 // RUN: mlir-opt -allow-unregistered-dialect %s -affine-scalrep | FileCheck %s
+// RUN: mlir-opt -allow-unregistered-dialect %s -affine-scalrep > %t
+// RUN: mlir-opt -allow-unregistered-dialect %t -affine-scalrep > %t.2
+// RUN: diff %t %t.2
 
 // CHECK-DAG: [[$MAP0:#map[0-9]*]] = affine_map<(d0, d1) -> (d1 + 1)>
 // CHECK-DAG: [[$MAP1:#map[0-9]*]] = affine_map<(d0, d1) -> (d0)>
@@ -1032,5 +1035,394 @@ func.func @vector_store_dead_elim_same_type(%arg0: memref<20x1xi64>) {
   // CHECK: affine.vector_store %[[CST2]], %arg0[%c0, %c0] : memref<20x1xi64>, vector<5xi64>
   affine.vector_store %cst1, %arg0[%c0, %c0] : memref<20x1xi64>, vector<5xi64>
   affine.vector_store %cst2, %arg0[%c0, %c0] : memref<20x1xi64>, vector<5xi64>
+  return
+}
+
+// CHECK-LABEL: func.func @loop_carried_store_load
+// CHECK-SAME: (%[[TARGET:.*]]: memref<16xi32>, %[[SEED:.*]]: i32)
+func.func @loop_carried_store_load(%arg0: memref<16xi32>, %seed: i32) {
+  // The ordinary forwarding rerun removes the newly created initial load.
+  // CHECK: affine.store %[[SEED]], %[[TARGET]][0] : memref<16xi32>
+  affine.store %seed, %arg0[0] : memref<16xi32>
+  // CHECK-NOT: affine.load
+  // CHECK: %[[RESULT:.*]] = affine.for %[[I:.*]] = 1 to 16 iter_args(%[[PREVIOUS:.*]] = %[[SEED]]) -> (i32) {
+  affine.for %i = 1 to 16 {
+    %current = arith.index_cast %i : index to i32
+    // CHECK: affine.store %[[CURRENT:.*]], %arg0[%[[I]]] : memref<16xi32>
+    affine.store %current, %arg0[%i] : memref<16xi32>
+    %previous = affine.load %arg0[%i - 1] : memref<16xi32>
+    // CHECK-NOT: affine.load
+    // CHECK: arith.addi %[[PREVIOUS]], %[[PREVIOUS]]
+    %used = arith.addi %previous, %previous : i32
+    // CHECK: affine.yield %[[CURRENT]] : i32
+    // CHECK-NEXT: } {test.keep = "loop-carried"}
+  } {test.keep = "loop-carried"}
+  return
+}
+
+// CHECK-LABEL: func.func @loop_carried_store_load_step_two
+func.func @loop_carried_store_load_step_two(%arg0: memref<16xi32>) {
+  // CHECK: %[[INIT:.*]] = affine.load %arg0[0] : memref<16xi32>
+  // CHECK: affine.for %[[I:.*]] = 2 to 16 step 2 iter_args(%[[PREVIOUS:.*]] = %[[INIT]]) -> (i32) {
+  affine.for %i = 2 to 16 step 2 {
+    %current = arith.index_cast %i : index to i32
+    // CHECK: affine.store %[[CURRENT:.*]], %arg0[%[[I]]] : memref<16xi32>
+    affine.store %current, %arg0[%i] : memref<16xi32>
+    %previous = affine.load %arg0[%i - 2] : memref<16xi32>
+    // CHECK-NOT: affine.load
+    // CHECK: arith.addi %[[PREVIOUS]], %[[PREVIOUS]]
+    %used = arith.addi %previous, %previous : i32
+    // CHECK: affine.yield %[[CURRENT]] : i32
+  }
+  return
+}
+
+// CHECK-LABEL: func.func @loop_carried_affine_apply
+func.func @loop_carried_affine_apply(%arg0: memref<16xi32>) {
+  // CHECK: %[[INIT:.*]] = affine.load %arg0[0] : memref<16xi32>
+  // CHECK: affine.for %[[I:.*]] = 1 to 16 iter_args(%[[PREVIOUS:.*]] = %[[INIT]]) -> (i32) {
+  affine.for %i = 1 to 16 {
+    %current = arith.index_cast %i : index to i32
+    affine.store %current, %arg0[%i] : memref<16xi32>
+    %previousIndex =
+        affine.apply affine_map<(d0) -> (d0 - 1)>(%i)
+    %previous = affine.load %arg0[%previousIndex] : memref<16xi32>
+    // CHECK-NOT: affine.load
+    // CHECK: arith.addi %[[PREVIOUS]], %[[PREVIOUS]]
+    %used = arith.addi %previous, %previous : i32
+  }
+  return
+}
+
+#symbolic_lower = affine_map<(d0) -> (d0)>
+#symbolic_upper = affine_map<(d0) -> (d0 + 16)>
+
+// CHECK-LABEL: func.func @loop_carried_symbolic_lower
+// CHECK-SAME: (%[[TARGET:.*]]: memref<?xi32>, %[[LOWER:.*]]: index)
+func.func @loop_carried_symbolic_lower(
+    %arg0: memref<?xi32>, %lower: index) {
+  // CHECK: %[[INIT:.*]] = affine.load %[[TARGET]][symbol(%[[LOWER]]) - 1] : memref<?xi32>
+  // CHECK: affine.for %[[I:.*]] = #{{.*}}(%[[LOWER]]) to #{{.*}}(%[[LOWER]]) iter_args(%[[PREVIOUS:.*]] = %[[INIT]]) -> (i32) {
+  affine.for %i = #symbolic_lower(%lower) to #symbolic_upper(%lower) {
+    %current = arith.index_cast %i : index to i32
+    affine.store %current, %arg0[%i] : memref<?xi32>
+    %previous = affine.load %arg0[%i - 1] : memref<?xi32>
+    // CHECK-NOT: affine.load
+    // CHECK: arith.addi %[[PREVIOUS]], %[[PREVIOUS]]
+    %used = arith.addi %previous, %previous : i32
+  }
+  return
+}
+
+// The stored value may itself depend on the load being forwarded.
+// CHECK-LABEL: func.func @loop_carried_recurrence
+func.func @loop_carried_recurrence(%arg0: memref<16xi32>) {
+  // CHECK: %[[INIT:.*]] = affine.load %arg0[0] : memref<16xi32>
+  // CHECK: affine.for %[[I:.*]] = 1 to 16 iter_args(%[[PREVIOUS:.*]] = %[[INIT]]) -> (i32) {
+  affine.for %i = 1 to 16 {
+    %previous = affine.load %arg0[%i - 1] : memref<16xi32>
+    // CHECK-NOT: affine.load
+    // CHECK: %[[CURRENT:.*]] = arith.addi %[[PREVIOUS]], %[[PREVIOUS]]
+    %current = arith.addi %previous, %previous : i32
+    // CHECK: affine.store %[[CURRENT]], %arg0[%[[I]]] : memref<16xi32>
+    affine.store %current, %arg0[%i] : memref<16xi32>
+    // CHECK: affine.yield %[[CURRENT]] : i32
+  }
+  return
+}
+
+// CHECK-LABEL: func.func @loop_carried_existing_iter_arg
+// CHECK-SAME: (%arg0: memref<16xi32>, %[[SEED:.*]]: i32)
+func.func @loop_carried_existing_iter_arg(
+    %arg0: memref<16xi32>, %seed: i32) -> i32 {
+  // CHECK: %[[INIT:.*]] = affine.load %arg0[0] : memref<16xi32>
+  // CHECK: %[[RESULT:.*]]:2 = affine.for %[[I:.*]] = 1 to 16 iter_args(%[[SUM:.*]] = %[[SEED]], %[[PREVIOUS:.*]] = %[[INIT]]) -> (i32, i32) {
+  %result = affine.for %i = 1 to 16 iter_args(%sum = %seed) -> i32 {
+    %current = arith.index_cast %i : index to i32
+    // CHECK: affine.store %[[CURRENT:.*]], %arg0[%[[I]]] : memref<16xi32>
+    affine.store %current, %arg0[%i] : memref<16xi32>
+    %previous = affine.load %arg0[%i - 1] : memref<16xi32>
+    // CHECK-NOT: affine.load
+    // CHECK: %[[NEXT:.*]] = arith.addi %[[SUM]], %[[PREVIOUS]]
+    %next = arith.addi %sum, %previous : i32
+    // CHECK: affine.yield %[[NEXT]], %[[CURRENT]] : i32, i32
+    affine.yield %next : i32
+  }
+  // CHECK: return %[[RESULT]]#0 : i32
+  return %result : i32
+}
+
+// A distance-two dependence needs two carried values and is left unchanged by
+// the initial distance-one implementation.
+// CHECK-LABEL: func.func @loop_carried_distance_two
+func.func @loop_carried_distance_two(%arg0: memref<16xi32>) {
+  // CHECK-NOT: iter_args
+  affine.for %i = 2 to 16 {
+    %current = arith.index_cast %i : index to i32
+    affine.store %current, %arg0[%i] : memref<16xi32>
+    // CHECK: affine.load %arg0[%{{.*}} - 2] : memref<16xi32>
+    %previous = affine.load %arg0[%i - 2] : memref<16xi32>
+    %used = arith.addi %previous, %previous : i32
+  }
+  return
+}
+
+// A second potentially aliasing writer prevents loop-carried forwarding.
+// CHECK-LABEL: func.func @loop_carried_may_alias_writer
+func.func @loop_carried_may_alias_writer(
+    %arg0: memref<16xi32>, %arg1: memref<16xi32>) {
+  // CHECK-NOT: iter_args
+  affine.for %i = 1 to 16 {
+    %current = arith.index_cast %i : index to i32
+    affine.store %current, %arg0[%i] : memref<16xi32>
+    affine.store %current, %arg1[0] : memref<16xi32>
+    // CHECK: affine.load %arg0[%{{.*}} - 1] : memref<16xi32>
+    %previous = affine.load %arg0[%i - 1] : memref<16xi32>
+    %used = arith.addi %previous, %previous : i32
+  }
+  return
+}
+
+// Proven-distinct memory permits an otherwise independent writer.
+// CHECK-LABEL: func.func @loop_carried_distinct_writer
+func.func @loop_carried_distinct_writer(
+    %arg0: memref<16xi32>, %arg1: memref<16xi32>) {
+  %target, %other = memref.distinct_objects %arg0, %arg1
+      : memref<16xi32>, memref<16xi32>
+  // CHECK: %[[INIT:.*]] = affine.load %{{.*}}[0] : memref<16xi32>
+  // CHECK: affine.for %[[I:.*]] = 1 to 16 iter_args(%[[PREVIOUS:.*]] = %[[INIT]]) -> (i32) {
+  affine.for %i = 1 to 16 {
+    %current = arith.index_cast %i : index to i32
+    affine.store %current, %target[%i] : memref<16xi32>
+    affine.store %current, %other[0] : memref<16xi32>
+    %previous = affine.load %target[%i - 1] : memref<16xi32>
+    // CHECK-NOT: affine.load
+    // CHECK: arith.addi %[[PREVIOUS]], %[[PREVIOUS]]
+    %used = arith.addi %previous, %previous : i32
+  }
+  return
+}
+
+// Hoisting the initial load out of an empty loop would introduce a new memory
+// access, so zero-trip loops are left unchanged.
+// CHECK-LABEL: func.func @loop_carried_zero_trip
+func.func @loop_carried_zero_trip(%arg0: memref<16xi32>) {
+  // CHECK-NOT: iter_args
+  affine.for %i = 1 to 1 {
+    %current = arith.index_cast %i : index to i32
+    affine.store %current, %arg0[%i] : memref<16xi32>
+    // CHECK: affine.load %arg0[%{{.*}} - 1] : memref<16xi32>
+    %previous = affine.load %arg0[%i - 1] : memref<16xi32>
+    %used = arith.addi %previous, %previous : i32
+  }
+  return
+}
+
+// A single-iteration loop has no loop-carried load to eliminate.
+// CHECK-LABEL: func.func @loop_carried_one_trip
+func.func @loop_carried_one_trip(%arg0: memref<16xi32>) {
+  // CHECK-NOT: iter_args
+  affine.for %i = 1 to 2 {
+    %current = arith.index_cast %i : index to i32
+    affine.store %current, %arg0[%i] : memref<16xi32>
+    // CHECK: affine.load %arg0[%{{.*}} - 1] : memref<16xi32>
+    %previous = affine.load %arg0[%i - 1] : memref<16xi32>
+    %used = arith.addi %previous, %previous : i32
+  }
+  return
+}
+
+// An operation with unknown memory effects may overwrite the carried element.
+// CHECK-LABEL: func.func @loop_carried_unknown_effect
+func.func @loop_carried_unknown_effect(%arg0: memref<16xi32>) {
+  // CHECK-NOT: iter_args
+  affine.for %i = 1 to 16 {
+    %current = arith.index_cast %i : index to i32
+    affine.store %current, %arg0[%i] : memref<16xi32>
+    "test.unknown_effect"() : () -> ()
+    // CHECK: affine.load %arg0[%{{.*}} - 1] : memref<16xi32>
+    %previous = affine.load %arg0[%i - 1] : memref<16xi32>
+    %used = arith.addi %previous, %previous : i32
+  }
+  return
+}
+
+// Surrounding loop IVs may remain in the initial access. The initial value is
+// loaded immediately before the inner loop, once for each outer iteration.
+// CHECK-LABEL: func.func @loop_carried_nested
+func.func @loop_carried_nested(%arg0: memref<4x16xi32>) {
+  affine.for %j = 0 to 4 {
+    // CHECK: %[[INIT:.*]] = affine.load %arg0[%{{.*}}, 0] : memref<4x16xi32>
+    // CHECK: affine.for %[[I:.*]] = 1 to 16 iter_args(%[[PREVIOUS:.*]] = %[[INIT]]) -> (i32) {
+    affine.for %i = 1 to 16 {
+      %current = arith.index_cast %i : index to i32
+      // CHECK: affine.store %[[CURRENT:.*]], %arg0[%{{.*}}, %[[I]]] : memref<4x16xi32>
+      affine.store %current, %arg0[%j, %i] : memref<4x16xi32>
+      %previous = affine.load %arg0[%j, %i - 1] : memref<4x16xi32>
+      // CHECK-NOT: affine.load
+      // CHECK: arith.addi %[[PREVIOUS]], %[[PREVIOUS]]
+      %used = arith.addi %previous, %previous : i32
+      // CHECK: affine.yield %[[CURRENT]] : i32
+    }
+  }
+  return
+}
+
+// A symbolic trip count cannot prove that the loop executes. Hoisting the
+// initial load could otherwise introduce a new memory access.
+// CHECK-LABEL: func.func @loop_carried_dynamic_trip
+func.func @loop_carried_dynamic_trip(
+    %arg0: memref<?xi32>, %upper: index) {
+  // CHECK-NOT: iter_args
+  affine.for %i = 1 to %upper {
+    %current = arith.index_cast %i : index to i32
+    affine.store %current, %arg0[%i] : memref<?xi32>
+    // CHECK: affine.load %arg0[%{{.*}} - 1] : memref<?xi32>
+    %previous = affine.load %arg0[%i - 1] : memref<?xi32>
+    %used = arith.addi %previous, %previous : i32
+  }
+  return
+}
+
+// Even a statically disjoint access on the same memref is conservatively
+// treated as another writer. AliasAnalysis only proves object-level aliasing.
+// CHECK-LABEL: func.func @loop_carried_second_same_memref_writer
+func.func @loop_carried_second_same_memref_writer(
+    %arg0: memref<32xi32>) {
+  // CHECK-NOT: iter_args
+  affine.for %i = 1 to 16 {
+    %current = arith.index_cast %i : index to i32
+    affine.store %current, %arg0[%i] : memref<32xi32>
+    affine.store %current, %arg0[%i + 16] : memref<32xi32>
+    // CHECK: affine.load %arg0[%{{.*}} - 1] : memref<32xi32>
+    %previous = affine.load %arg0[%i - 1] : memref<32xi32>
+    %used = arith.addi %previous, %previous : i32
+  }
+  return
+}
+
+#even_iteration = affine_set<(d0) : (d0 mod 2 == 0)>
+
+// A conditional writer may replace the value carried to the next iteration.
+// CHECK-LABEL: func.func @loop_carried_conditional_writer
+func.func @loop_carried_conditional_writer(%arg0: memref<16xi32>) {
+  // CHECK-NOT: iter_args
+  affine.for %i = 1 to 16 {
+    %current = arith.index_cast %i : index to i32
+    affine.store %current, %arg0[%i] : memref<16xi32>
+    affine.if #even_iteration(%i) {
+      affine.store %current, %arg0[%i] : memref<16xi32>
+    }
+    // CHECK: affine.load %arg0[%{{.*}} - 1] : memref<16xi32>
+    %previous = affine.load %arg0[%i - 1] : memref<16xi32>
+    %used = arith.addi %previous, %previous : i32
+  }
+  return
+}
+
+#mod_two = affine_map<(d0) -> (d0 mod 2)>
+#previous_mod_two = affine_map<(d0) -> ((d0 - 1) mod 2)>
+
+// A simple ring-buffer access is also forwardable when shifting the load by
+// one iteration proves the access functions identical and the same-iteration
+// slots remain distinct.
+// CHECK-LABEL: func.func @loop_carried_modulo
+func.func @loop_carried_modulo(%arg0: memref<2xi32>) {
+  // CHECK: %[[INIT:.*]] = affine.load %arg0[0] : memref<2xi32>
+  // CHECK: affine.for %[[I:.*]] = 1 to 16 iter_args(%[[PREVIOUS:.*]] = %[[INIT]]) -> (i32) {
+  affine.for %i = 1 to 16 {
+    %current = arith.index_cast %i : index to i32
+    %slot = affine.apply #mod_two(%i)
+    // CHECK: affine.store %[[CURRENT:.*]], %arg0[%{{.*}}] : memref<2xi32>
+    affine.store %current, %arg0[%slot] : memref<2xi32>
+    %previousSlot = affine.apply #previous_mod_two(%i)
+    %previous = affine.load %arg0[%previousSlot] : memref<2xi32>
+    // CHECK-NOT: affine.load
+    // CHECK: arith.addi %[[PREVIOUS]], %[[PREVIOUS]]
+    %used = arith.addi %previous, %previous : i32
+    // CHECK: affine.yield %[[CURRENT]] : i32
+  }
+  return
+}
+
+// An exact distance component only characterizes dependence pairs that exist;
+// it does not prove that adjacent accesses coincide on every iteration. Here
+// store(i) and load(i + 1) access the same element only for i = 1.
+// CHECK-LABEL: func.func @loop_carried_partial_distance_one
+func.func @loop_carried_partial_distance_one(
+    %arg0: memref<16x16xi32>) {
+  // CHECK-NOT: iter_args
+  affine.for %i = 1 to 16 {
+    %current = arith.index_cast %i : index to i32
+    affine.store %current, %arg0[%i, 1] : memref<16x16xi32>
+    // CHECK: affine.load %arg0[%{{.*}} - 1, %{{.*}} - 1]
+    %previous = affine.load %arg0[%i - 1, %i - 1] : memref<16x16xi32>
+    %used = arith.addi %previous, %previous : i32
+  }
+  return
+}
+
+// Multiple transitive dependence distances are harmless when an
+// unconditional store updates the same cell after each load. The immediately
+// preceding store is still the value read on every iteration after the first.
+// CHECK-LABEL: func.func @loop_carried_constant_address
+func.func @loop_carried_constant_address(%arg0: memref<1xi32>) {
+  // CHECK: %[[INIT:.*]] = affine.load %arg0[0] : memref<1xi32>
+  // CHECK: affine.for %{{.*}} = 0 to 16 iter_args(%[[PREVIOUS:.*]] = %[[INIT]]) -> (i32) {
+  affine.for %i = 0 to 16 {
+    %previous = affine.load %arg0[0] : memref<1xi32>
+    // CHECK-NOT: affine.load
+    // CHECK: %[[CURRENT:.*]] = arith.addi %[[PREVIOUS]], %[[PREVIOUS]]
+    %current = arith.addi %previous, %previous : i32
+    // CHECK: affine.store %[[CURRENT]], %arg0[0] : memref<1xi32>
+    affine.store %current, %arg0[0] : memref<1xi32>
+    // CHECK: affine.yield %[[CURRENT]] : i32
+  }
+  return
+}
+
+#multiple_lower_bounds = affine_map<() -> (0, 1)>
+
+// A multi-result lower bound denotes a maximum. Materializing its initial
+// access needs more than one affine.apply result, so the initial implementation
+// leaves it unchanged.
+// CHECK-LABEL: func.func @loop_carried_multiple_lower_bounds
+func.func @loop_carried_multiple_lower_bounds(%arg0: memref<16xi32>) {
+  // CHECK-NOT: iter_args
+  // CHECK: affine.for %[[I:.*]] = max #{{.*}}() to 16 {
+  affine.for %i = max #multiple_lower_bounds() to 16 {
+    %current = arith.index_cast %i : index to i32
+    affine.store %current, %arg0[%i] : memref<16xi32>
+    // CHECK: affine.load %arg0[%[[I]] - 1] : memref<16xi32>
+    %previous = affine.load %arg0[%i - 1] : memref<16xi32>
+    %used = arith.addi %previous, %previous : i32
+  }
+  return
+}
+
+// Two independent recurrences in the same loop are both forwarded even though
+// adding the first iter_arg replaces the loop being analyzed.
+// CHECK-LABEL: func.func @loop_carried_two_independent
+func.func @loop_carried_two_independent(
+    %arg0: memref<16xi32>, %arg1: memref<16xi32>) {
+  %left, %right = memref.distinct_objects %arg0, %arg1
+      : memref<16xi32>, memref<16xi32>
+  // CHECK-DAG: %[[LEFT_INIT:.*]] = affine.load %{{.*}}[0] : memref<16xi32>
+  // CHECK-DAG: %[[RIGHT_INIT:.*]] = affine.load %{{.*}}[0] : memref<16xi32>
+  // CHECK: %{{.*}}:2 = affine.for %[[I:.*]] = 1 to 16 iter_args(%[[LEFT_PREVIOUS:.*]] = %[[LEFT_INIT]], %[[RIGHT_PREVIOUS:.*]] = %[[RIGHT_INIT]]) -> (i32, i32) {
+  affine.for %i = 1 to 16 {
+    %leftPrevious = affine.load %left[%i - 1] : memref<16xi32>
+    %leftCurrent = arith.addi %leftPrevious, %leftPrevious : i32
+    affine.store %leftCurrent, %left[%i] : memref<16xi32>
+    %rightPrevious = affine.load %right[%i - 1] : memref<16xi32>
+    %rightCurrent = arith.addi %rightPrevious, %rightPrevious : i32
+    affine.store %rightCurrent, %right[%i] : memref<16xi32>
+    // CHECK-NOT: affine.load
+    // CHECK: %[[LEFT_CURRENT:.*]] = arith.addi %[[LEFT_PREVIOUS]], %[[LEFT_PREVIOUS]]
+    // CHECK: affine.store %[[LEFT_CURRENT]], %{{.*}}[%[[I]]]
+    // CHECK: %[[RIGHT_CURRENT:.*]] = arith.addi %[[RIGHT_PREVIOUS]], %[[RIGHT_PREVIOUS]]
+    // CHECK: affine.store %[[RIGHT_CURRENT]], %{{.*}}[%[[I]]]
+    // CHECK: affine.yield %[[LEFT_CURRENT]], %[[RIGHT_CURRENT]] : i32, i32
+  }
   return
 }
