@@ -528,6 +528,38 @@ func.func @fold_empty_loop_trip_count_0() -> (index, index) {
 
 // -----
 
+// CHECK-LABEL: func @extreme_nonempty_loop_not_folded
+func.func @extreme_nonempty_loop_not_folded() -> (index, index) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  // CHECK: affine.for
+  %res:2 = affine.for %i = -9223372036854775808 to 9223372036854775807
+      step 9223372036854775807
+      iter_args(%arg0 = %c0, %arg1 = %c1) -> (index, index) {
+    affine.yield %arg1, %arg0 : index, index
+  }
+  return %res#0, %res#1 : index, index
+}
+
+// -----
+
+// CHECK-LABEL: func @extreme_empty_loop_folded
+func.func @extreme_empty_loop_folded() -> (index, index) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %res:2 = affine.for %i = 9223372036854775807 to -9223372036854775808
+      iter_args(%arg0 = %c0, %arg1 = %c1) -> (index, index) {
+    affine.yield %arg1, %arg0 : index, index
+  }
+  // CHECK-DAG: %[[ZERO:.*]] = arith.constant 0
+  // CHECK-DAG: %[[ONE:.*]] = arith.constant 1
+  // CHECK-NOT: affine.for
+  // CHECK: return %[[ZERO]], %[[ONE]]
+  return %res#0, %res#1 : index, index
+}
+
+// -----
+
 // CHECK-LABEL:  func @fold_empty_loop_trip_count_unknown
 func.func @fold_empty_loop_trip_count_unknown(%in : index) -> (index, index) {
   %c0 = arith.constant 0 : index

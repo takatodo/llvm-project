@@ -17,6 +17,15 @@ func.func @affine_constant_loops() {
   affine.for %i = 10 to 0 {
     affine.yield
   }
+  // The mathematical span is UINT64_MAX, so the trip count is three.
+  // CHECK: "test.trip-count" = 3
+  affine.for %i = -9223372036854775808 to 9223372036854775807 step 9223372036854775807 {
+    affine.yield
+  }
+  // CHECK: "test.trip-count" = 0
+  affine.for %i = 9223372036854775807 to -9223372036854775808 {
+    affine.yield
+  }
   return
 }
 
