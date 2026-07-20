@@ -2560,6 +2560,15 @@ static LogicalResult foldLoopBounds(AffineForOp forOp) {
   return success(folded);
 }
 
+/// Compute the trip count for signed constant bounds without signed overflow.
+static uint64_t computeConstantTripCount(int64_t lb, int64_t ub, int64_t step) {
+  assert(step > 0 && "expected a positive step");
+  if (ub <= lb)
+    return 0;
+  uint64_t loopSpan = static_cast<uint64_t>(ub) - static_cast<uint64_t>(lb);
+  return llvm::divideCeil(loopSpan, static_cast<uint64_t>(step));
+}
+
 /// Returns constant trip count in trivial cases.
 static std::optional<uint64_t> getTrivialConstantTripCount(AffineForOp forOp) {
   int64_t step = forOp.getStepAsInt();
@@ -2567,7 +2576,7 @@ static std::optional<uint64_t> getTrivialConstantTripCount(AffineForOp forOp) {
     return std::nullopt;
   int64_t lb = forOp.getConstantLowerBound();
   int64_t ub = forOp.getConstantUpperBound();
-  return ub - lb <= 0 ? 0 : (ub - lb + step - 1) / step;
+  return computeConstantTripCount(lb, ub, step);
 }
 
 /// Fold the empty loop.
@@ -2835,10 +2844,7 @@ std::optional<APInt> AffineForOp::getStaticTripCount() {
   if (hasConstantBounds()) {
     int64_t lb = getConstantLowerBound();
     int64_t ub = getConstantUpperBound();
-    int64_t loopSpan = ub - lb;
-    if (loopSpan < 0)
-      loopSpan = 0;
-    return APInt(64, llvm::divideCeilSigned(loopSpan, step));
+    return APInt(64, computeConstantTripCount(lb, ub, step));
   }
 
   auto lbMap = getLowerBoundMap();
