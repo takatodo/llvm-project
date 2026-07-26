@@ -1,5 +1,6 @@
 # Exclude tests from libMLIR.so
 add_mlir_library(MLIRLinalgTestPasses
+  TestOnlineAttention.cpp
   TestLinalgDecomposeOps.cpp
   TestLinalgDropUnitDims.cpp
   TestLinalgElementwiseFusion.cpp
@@ -20,6 +21,7 @@ mlir_target_link_libraries(MLIRLinalgTestPasses PUBLIC
   MLIRLinalgDialect
   MLIRLinalgTransforms
   MLIRLLVMToLLVMIRTranslation
+  MLIRMathDialect
   MLIRMemRefDialect
   MLIRParser
   MLIRPass

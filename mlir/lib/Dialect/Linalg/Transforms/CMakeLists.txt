@@ -28,6 +28,7 @@ add_mlir_dialect_library(MLIRLinalgTransforms
   ShardingInterfaceImpl.cpp
   SimplifyDepthwiseConv.cpp
   NamedToElementwise.cpp
+  OnlineAttention.cpp
   BlockPackMatmul.cpp
   PackAndUnpackPatterns.cpp
   Padding.cpp
@@ -73,6 +74,7 @@ add_mlir_dialect_library(MLIRLinalgTransforms
   MLIRShardTransforms
   MLIRLinalgDialect
   MLIRLinalgUtils
+  MLIRMathDialect
   MLIRSCFDialect
   MLIRSCFTransforms
   MLIRPass
