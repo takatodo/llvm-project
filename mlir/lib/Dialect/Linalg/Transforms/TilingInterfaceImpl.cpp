@@ -431,6 +431,71 @@ getPartialResultAffineMaps(LinalgOp linalgOp,
   return partialReductionMaps;
 }
 
+/// Return true when a linalg.reduce explicitly opts into using its variadic
+/// combiner as a coupled partial-reduction algebra. This prototype contract
+/// states that the combiner is associative and commutative and that every init
+/// is a two-sided identity. Without this assertion, the generic matcher below
+/// remains responsible for proving an independent built-in reduction.
+static bool hasCoupledPartialReductionContract(LinalgOp linalgOp) {
+  auto reduceOp = dyn_cast<linalg::ReduceOp>(linalgOp.getOperation());
+  if (!reduceOp)
+    return false;
+  auto contract =
+      reduceOp->getAttrOfType<StringAttr>("partial_reduction_contract");
+  return contract && contract.getValue() == "associative_commutative_identity";
+}
+
+static LogicalResult verifyCoupledPartialReductionContract(LinalgOp linalgOp) {
+  for (Operation &nested : linalgOp->getRegion(0).front().without_terminator())
+    if (!isMemoryEffectFree(&nested))
+      return linalgOp.emitOpError(
+          "coupled partial-reduction combiner must be memory-effect-free");
+  return success();
+}
+
+/// Broadcast every explicitly asserted identity init over the partial-result
+/// dimensions. Unlike the independent-reduction path, this does not attempt to
+/// infer a neutral element from one payload operation.
+static FailureOr<SmallVector<Value>>
+generateCoupledReductionIdentities(LinalgOp linalgOp, OpBuilder &b,
+                                   Location loc, ArrayRef<OpFoldResult> sizes,
+                                   const SetVector<unsigned> &reductionDims) {
+  if (linalgOp.hasPureBufferSemantics())
+    return linalgOp.emitOpError("expected operation to have tensor semantics");
+
+  SmallVector<AffineMap> partialResultMaps =
+      getPartialResultAffineMaps(linalgOp, reductionDims);
+  SmallVector<Value> identities;
+  for (auto [init, partialMap] :
+       llvm::zip_equal(linalgOp.getDpsInits(), partialResultMaps)) {
+    auto initType = dyn_cast<RankedTensorType>(init.getType());
+    if (!initType)
+      return linalgOp.emitOpError("expected ranked tensor init");
+
+    SmallVector<OpFoldResult> partialShape;
+    SmallVector<OpFoldResult> initShape = tensor::getMixedSizes(b, loc, init);
+    for (auto [resultIdx, expression] :
+         llvm::enumerate(partialMap.getResults())) {
+      if (isa<AffineConstantExpr>(expression)) {
+        partialShape.push_back(initShape[resultIdx]);
+        continue;
+      }
+      unsigned dim = cast<AffineDimExpr>(expression).getPosition();
+      partialShape.push_back(sizes[dim]);
+    }
+
+    Value empty = tensor::EmptyOp::create(b, loc, partialShape,
+                                          initType.getElementType());
+    unsigned partialRank = partialShape.size();
+    SmallVector<int64_t> addedDimensions =
+        llvm::to_vector(llvm::seq<int64_t>(initType.getRank(), partialRank));
+    auto broadcast =
+        linalg::BroadcastOp::create(b, loc, init, empty, addedDimensions);
+    identities.push_back(broadcast->getResult(0));
+  }
+  return identities;
+}
+
 struct InitSliceInfo {
   SmallVector<int64_t> resultShape;
   SmallVector<OpFoldResult> offsets;
@@ -548,6 +613,13 @@ struct LinalgOpPartialReductionInterface
     OpBuilder::InsertionGuard guard(b);
     if (linalgOp.hasPureBufferSemantics())
       return op->emitOpError("expected operation to have tensor semantics");
+
+    if (hasCoupledPartialReductionContract(linalgOp)) {
+      if (failed(verifyCoupledPartialReductionContract(linalgOp)))
+        return failure();
+      return generateCoupledReductionIdentities(linalgOp, b, loc, sizes,
+                                                reductionDims);
+    }
 
     SmallVector<AffineMap> partialResultMaps =
         getPartialResultAffineMaps(linalgOp, reductionDims);
@@ -701,6 +773,35 @@ struct LinalgOpPartialReductionInterface
     auto linalgOp = cast<LinalgOp>(op);
     SmallVector<AffineMap> partialReductionMaps =
         getPartialResultAffineMaps(linalgOp, reductionDims);
+
+    if (hasCoupledPartialReductionContract(linalgOp)) {
+      if (failed(verifyCoupledPartialReductionContract(linalgOp)))
+        return failure();
+      if (partialReduce.size() !=
+          static_cast<size_t>(linalgOp.getNumDpsInits()))
+        return op->emitOpError("expected one coupled partial result per init");
+
+      SmallVector<int64_t> partialReductionDims;
+      for (auto [resultNum, expression] :
+           llvm::enumerate(partialReductionMaps.front().getResults())) {
+        auto dimExpression = dyn_cast<AffineDimExpr>(expression);
+        if (dimExpression &&
+            reductionDims.contains(dimExpression.getPosition()))
+          partialReductionDims.push_back(resultNum);
+      }
+
+      auto source = cast<linalg::ReduceOp>(op);
+      auto merged = linalg::ReduceOp::create(
+          b, loc, partialReduce, linalgOp.getDpsInits(), partialReductionDims,
+          /*bodyBuild=*/nullptr);
+      IRMapping mapping;
+      source.getCombiner().cloneInto(&merged.getCombiner(),
+                                     merged.getCombiner().begin(), mapping);
+      merged->setAttr("partial_reduction_contract",
+                      source->getAttr("partial_reduction_contract"));
+      return MergeResult{{merged},
+                         llvm::to_vector_of<Value>(merged->getResults())};
+    }
 
     // Permute the reduction dims as permuted by the partial result map.
     SmallVector<Operation *> mergeOperations;
