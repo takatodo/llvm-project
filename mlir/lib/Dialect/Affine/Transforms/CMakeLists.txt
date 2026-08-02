@@ -9,6 +9,7 @@ add_mlir_dialect_library(MLIRAffineTransforms
   DecomposeAffineOps.cpp
   FoldMemRefAliasOps.cpp
   LoopCarriedComputationReuse.cpp
+  LoopCarriedReductionReuse.cpp
   LoopCarriedReuseUtils.cpp
   LoopCoalescing.cpp
   LoopFusion.cpp

@@ -203,6 +203,26 @@ def AffineLoopCarriedComputationReuse
   let dependentDialects = ["arith::ArithDialect"];
 }
 
+def AffineLoopCarriedReductionReuse
+    : Pass<"affine-loop-carried-reduction-reuse", "func::FuncOp"> {
+  let summary = "Reuse partial reductions across affine loop iterations";
+  let description = [{
+    This pass recognizes a homogeneous associative reduction tree whose affine
+    load leaves form two or more equal-length chains translated by exactly one
+    loop iteration. It folds each leading chain position once before the loop,
+    carries those partial reductions through iter_args, and computes only the
+    newest partial reduction in each iteration.
+
+    The initial form handles modular integer addition. Additions with overflow
+    promises are rejected because regrouping them may change poison. Ambiguous
+    access correspondence, source modification, unsupported loop-local
+    indices, unsafe preloads, and trees without a strict load reduction are
+    also rejected.
+  }];
+  let constructor = "mlir::affine::createAffineLoopCarriedReductionReusePass()";
+  let dependentDialects = ["arith::ArithDialect"];
+}
+
 def AffineLoopTiling : Pass<"affine-loop-tile", "func::FuncOp"> {
   let summary = "Tile affine loop nests";
   let constructor = "mlir::affine::createLoopTilingPass()";
