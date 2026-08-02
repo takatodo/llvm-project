@@ -252,6 +252,39 @@ func.func @different_sources(%a0: memref<10xi32>, %b0: memref<10xi32>,
   return
 }
 
+// A translated producer may also consume a stable loop-invariant load. The
+// whole producer still advances by one iteration even though only one of its
+// load leaves is translated.
+
+// CHECK-LABEL: func.func @translated_with_invariant_load
+// CHECK: %[[A0:.*]] = affine.load %[[SRC:.*]][0]
+// CHECK: %[[W0:.*]] = affine.load %{{.*}}[0]
+// CHECK: %[[INITIAL:.*]] = arith.addi %[[A0]], %[[W0]]
+// CHECK: affine.for %[[I:.*]] = 0 to 8
+// CHECK-SAME: iter_args(%[[PREVIOUS:.*]] = %[[INITIAL]])
+// CHECK: %[[B:.*]] = affine.load %[[SRC]][%[[I]] + 1]
+// CHECK: %[[W:.*]] = affine.load %{{.*}}[0]
+// CHECK: %[[CURRENT:.*]] = arith.addi %[[B]], %[[W]]
+// CHECK: arith.subi %[[CURRENT]], %[[PREVIOUS]]
+// CHECK: affine.yield %[[CURRENT]]
+func.func @translated_with_invariant_load(
+    %src0: memref<9xi32>, %weight0: memref<1xi32>,
+    %dst0: memref<8xi32>) {
+  %src, %weight, %dst = memref.distinct_objects %src0, %weight0, %dst0
+      : memref<9xi32>, memref<1xi32>, memref<8xi32>
+  affine.for %i = 0 to 8 {
+    %a = affine.load %src[%i] : memref<9xi32>
+    %wa = affine.load %weight[0] : memref<1xi32>
+    %left = arith.addi %a, %wa : i32
+    %b = affine.load %src[%i + 1] : memref<9xi32>
+    %wb = affine.load %weight[0] : memref<1xi32>
+    %right = arith.addi %b, %wb : i32
+    %difference = arith.subi %right, %left : i32
+    affine.store %difference, %dst[%i] : memref<8xi32>
+  }
+  return
+}
+
 // Repeated loop-invariant computations belong to LICM/CSE, not translated
 // loop-carried reuse.
 

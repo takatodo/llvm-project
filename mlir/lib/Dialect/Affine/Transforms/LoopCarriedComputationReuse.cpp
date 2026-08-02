@@ -11,18 +11,15 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "LoopCarriedReuseUtils.h"
 #include "mlir/Dialect/Affine/Transforms/Passes.h"
 
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
-#include "mlir/Dialect/Affine/IR/AffineValueMap.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
-#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
@@ -52,65 +49,6 @@ struct ReuseCandidate {
   SmallVector<Operation *> earlierOps;
   SmallVector<Value> sources;
 };
-
-static void canonicalizeAccess(AffineLoadOp load, AffineMap &map,
-                               SmallVectorImpl<Value> &operands) {
-  map = load.getAffineMap();
-  llvm::append_range(operands, load.getMapOperands());
-  fullyComposeAffineMapAndOperands(&map, &operands);
-  map = simplifyAffineMap(map);
-  canonicalizeMapAndOperands(&map, &operands);
-}
-
-/// Return whether evaluating `earlier` one loop step later accesses exactly
-/// the location accessed by `later` in the current iteration.
-static bool areLoadsOneIterationApart(AffineLoadOp earlier, AffineLoadOp later,
-                                      AffineForOp loop, bool &isTranslated) {
-  if (earlier.getMemRef() != later.getMemRef() ||
-      earlier.getType() != later.getType())
-    return false;
-
-  AffineMap earlierMap, laterMap;
-  SmallVector<Value> earlierOperands, laterOperands;
-  canonicalizeAccess(earlier, earlierMap, earlierOperands);
-  canonicalizeAccess(later, laterMap, laterOperands);
-
-  auto hasUnsupportedLoopLocalOperand = [&](ArrayRef<Value> operands) {
-    return llvm::any_of(operands, [&](Value operand) {
-      return operand != loop.getInductionVar() &&
-             !loop.isDefinedOutsideOfLoop(operand);
-    });
-  };
-  if (hasUnsupportedLoopLocalOperand(earlierOperands) ||
-      hasUnsupportedLoopLocalOperand(laterOperands))
-    return false;
-
-  MLIRContext *context = loop.getContext();
-  SmallVector<AffineExpr> dimReplacements;
-  SmallVector<AffineExpr> symbolReplacements;
-  for (unsigned i = 0; i < earlierMap.getNumDims(); ++i)
-    dimReplacements.push_back(getAffineDimExpr(i, context));
-  for (unsigned i = 0; i < earlierMap.getNumSymbols(); ++i)
-    symbolReplacements.push_back(getAffineSymbolExpr(i, context));
-
-  for (auto [index, operand] : llvm::enumerate(earlierOperands)) {
-    if (operand != loop.getInductionVar())
-      continue;
-    isTranslated = true;
-    if (index < earlierMap.getNumDims())
-      dimReplacements[index] = dimReplacements[index] + loop.getStepAsInt();
-    else
-      symbolReplacements[index - earlierMap.getNumDims()] =
-          symbolReplacements[index - earlierMap.getNumDims()] +
-          loop.getStepAsInt();
-  }
-
-  AffineMap shiftedEarlierMap = earlierMap.replaceDimsAndSymbols(
-      dimReplacements, symbolReplacements, earlierMap.getNumDims(),
-      earlierMap.getNumSymbols());
-  return AffineValueMap(shiftedEarlierMap, earlierOperands) ==
-         AffineValueMap(laterMap, laterOperands);
-}
 
 /// Match two side-effect-free single-result DAGs. The only varying leaves are
 /// affine loads separated by one loop iteration. Equal values must be defined
@@ -152,18 +90,20 @@ private:
     auto earlierLoad = earlier.getDefiningOp<AffineLoadOp>();
     auto laterLoad = later.getDefiningOp<AffineLoadOp>();
     if (earlierLoad || laterLoad) {
-      if (!earlierLoad || !laterLoad || earlierLoad->getParentOp() != loop ||
-          laterLoad->getParentOp() != loop ||
-          !loop.isDefinedOutsideOfLoop(earlierLoad.getMemRef()) ||
-          !areLoadsOneIterationApart(earlierLoad, laterLoad, loop,
-                                     hasTranslatedLoad))
+      if (!earlierLoad || !laterLoad)
         return failure();
-      for (Value operand : earlierLoad.getMapOperands())
-        if (failed(recordAffineApplyDependencies(operand, depth + 1)))
-          return failure();
+      FailureOr<loop_carried_reuse::LoadAcrossIterationMatch> accessMatch =
+          loop_carried_reuse::matchLoadsAcrossOneIteration(earlierLoad,
+                                                           laterLoad, loop);
+      if (failed(accessMatch))
+        return failure();
+      for (Operation *operation : accessMatch->earlierIndexOps)
+        if (seenEarlier.insert(operation).second)
+          earlierOps.push_back(operation);
       mapValues(earlier, later);
       record(earlierLoad, laterLoad);
-      sources.insert(earlierLoad.getMemRef());
+      sources.insert(accessMatch->source);
+      hasTranslatedLoad |= accessMatch->isTranslated;
       return success();
     }
 
@@ -194,24 +134,6 @@ private:
     return success();
   }
 
-  LogicalResult recordAffineApplyDependencies(Value value, unsigned depth) {
-    if (depth > maxComputationDepth)
-      return failure();
-    if (value == loop.getInductionVar() || loop.isDefinedOutsideOfLoop(value))
-      return success();
-    auto apply = value.getDefiningOp<AffineApplyOp>();
-    if (!apply || apply->getParentOp() != loop)
-      return failure();
-    if (seenEarlier.contains(apply))
-      return success();
-    for (Value operand : apply.getMapOperands())
-      if (failed(recordAffineApplyDependencies(operand, depth + 1)))
-        return failure();
-    if (seenEarlier.insert(apply).second)
-      earlierOps.push_back(apply);
-    return success();
-  }
-
   void mapValues(Value earlier, Value later) {
     earlierToLater.try_emplace(earlier, later);
     laterToEarlier.try_emplace(later, earlier);
@@ -234,74 +156,6 @@ private:
   SmallVector<Operation *> laterOps;
   bool hasTranslatedLoad = false;
 };
-
-static bool isSourceStable(AffineForOp loop, Value source,
-                           AliasAnalysis &aliasAnalysis) {
-  bool stable = true;
-  (void)loop.getBody()->walk<WalkOrder::PostOrder>([&](Operation *operation) {
-    // Recursive-effect operations derive their effects from nested operations
-    // unless they also expose direct effects. The post-order walk has already
-    // checked those nested operations.
-    if (operation->hasTrait<OpTrait::HasRecursiveMemoryEffects>() &&
-        !isa<MemoryEffectOpInterface>(operation))
-      return WalkResult::advance();
-    if (aliasAnalysis.getModRef(operation, source).isMod()) {
-      stable = false;
-      return WalkResult::interrupt();
-    }
-    return WalkResult::advance();
-  });
-  return stable;
-}
-
-/// Return whether the loop is proven to execute at least twice. Handle
-/// constant bounds directly to avoid overflowing a signed bound difference.
-/// Reject a negative symbolic result returned in an APInt as well.
-static bool hasAtLeastTwoIterations(AffineForOp loop) {
-  if (loop.hasConstantBounds()) {
-    int64_t lowerBound = loop.getConstantLowerBound();
-    int64_t upperBound = loop.getConstantUpperBound();
-    if (upperBound <= lowerBound)
-      return false;
-    uint64_t span =
-        static_cast<uint64_t>(upperBound) - static_cast<uint64_t>(lowerBound);
-    return span > static_cast<uint64_t>(loop.getStepAsInt());
-  }
-
-  std::optional<APInt> tripCount = loop.getStaticTripCount();
-  return tripCount && !tripCount->isNegative() && tripCount->ugt(1);
-}
-
-/// Return true only when the loop executes at least twice, every source is
-/// stable, and moving `prologueOps` before the loop does not cross a blocking
-/// operation in the first iteration.
-static bool isSafeToPreload(AffineForOp loop, ValueRange sources,
-                            ArrayRef<Operation *> prologueOps,
-                            AliasAnalysis &aliasAnalysis) {
-  if (loop.getLowerBoundMap().getNumResults() != 1 ||
-      !hasAtLeastTwoIterations(loop) || sources.empty() || prologueOps.empty())
-    return false;
-  if (llvm::any_of(sources, [&](Value source) {
-        return !isSourceStable(loop, source, aliasAnalysis);
-      }))
-    return false;
-
-  Operation *root = prologueOps.back();
-  if (!root || root->getParentOp() != loop)
-    return false;
-  llvm::SmallPtrSet<Operation *, 16> prologueSet(prologueOps.begin(),
-                                                 prologueOps.end());
-  for (Operation &operation : loop.getBody()->without_terminator()) {
-    bool reachedRoot = &operation == root;
-    if (!prologueSet.contains(&operation) &&
-        !isa<AffineReadOpInterface, AffineWriteOpInterface>(operation) &&
-        !isPure(&operation))
-      return false;
-    if (reachedRoot)
-      return true;
-  }
-  return false;
-}
 
 static std::optional<ReuseCandidate>
 findReuseCandidate(AffineForOp loop, AliasAnalysis &aliasAnalysis) {
@@ -335,7 +189,8 @@ findReuseCandidate(AffineForOp loop, AliasAnalysis &aliasAnalysis) {
         SmallVector<Operation *> earlierOps = matcher.takeEarlierOps();
         SmallVector<Value> sources = matcher.takeSources();
         if (earlierOps.empty() || sources.empty() ||
-            !isSafeToPreload(loop, sources, earlierOps, aliasAnalysis))
+            !loop_carried_reuse::isSafeToPreload(loop, sources, earlierOps,
+                                                 aliasAnalysis))
           continue;
 
         llvm::SmallPtrSet<Operation *, 16> earlierSet(earlierOps.begin(),
@@ -359,50 +214,6 @@ findReuseCandidate(AffineForOp loop, AliasAnalysis &aliasAnalysis) {
   return std::nullopt;
 }
 
-static LogicalResult materializeReuse(IRRewriter &rewriter, AffineForOp loop,
-                                      ReuseCandidate candidate) {
-  OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPoint(loop);
-
-  Value lowerBound;
-  if (loop.hasConstantLowerBound())
-    lowerBound = arith::ConstantIndexOp::create(rewriter, loop.getLoc(),
-                                                loop.getConstantLowerBound());
-  else
-    lowerBound =
-        AffineApplyOp::create(rewriter, loop.getLoc(), loop.getLowerBoundMap(),
-                              loop.getLowerBoundOperands());
-
-  IRMapping mapping;
-  mapping.map(loop.getInductionVar(), lowerBound);
-  SmallVector<Operation *> clonedOps;
-  clonedOps.reserve(candidate.earlierOps.size());
-  for (Operation *operation : candidate.earlierOps)
-    clonedOps.push_back(rewriter.clone(*operation, mapping));
-  Value initial = mapping.lookup(candidate.earlierRoot);
-
-  BlockArgument carried;
-  FailureOr<LoopLikeOpInterface> replacement = loop.replaceWithAdditionalYields(
-      rewriter, initial, /*replaceInitOperandUsesInLoop=*/false,
-      [&](OpBuilder &, Location, ArrayRef<BlockArgument> newArguments) {
-        carried = newArguments.front();
-        return SmallVector<Value>{candidate.laterRoot};
-      });
-  if (failed(replacement)) {
-    for (Operation *operation : llvm::reverse(clonedOps))
-      rewriter.eraseOp(operation);
-    if (lowerBound.use_empty())
-      rewriter.eraseOp(lowerBound.getDefiningOp());
-    return failure();
-  }
-
-  candidate.earlierRoot.replaceAllUsesWith(carried);
-  for (Operation *operation : llvm::reverse(candidate.earlierOps))
-    if (isOpTriviallyDead(operation))
-      rewriter.eraseOp(operation);
-  return success();
-}
-
 struct AffineLoopCarriedComputationReuse
     : public affine::impl::AffineLoopCarriedComputationReuseBase<
           AffineLoopCarriedComputationReuse> {
@@ -416,8 +227,9 @@ struct AffineLoopCarriedComputationReuse
     for (AffineForOp loop : loops) {
       std::optional<ReuseCandidate> candidate =
           findReuseCandidate(loop, aliasAnalysis);
-      if (candidate &&
-          failed(materializeReuse(rewriter, loop, std::move(*candidate)))) {
+      if (candidate && failed(loop_carried_reuse::materializeLoopCarriedValue(
+                           rewriter, loop, candidate->earlierRoot,
+                           candidate->laterRoot, candidate->earlierOps))) {
         signalPassFailure();
         return;
       }
