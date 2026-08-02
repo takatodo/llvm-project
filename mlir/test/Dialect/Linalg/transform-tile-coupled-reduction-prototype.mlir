@@ -12,6 +12,9 @@ func.func @coupled_logsumexp(
       {partial_reduction_contract = "associative_commutative_identity"}
       (%leftMaximum: f32, %leftSum: f32,
        %rightMaximum: f32, %rightSum: f32) {
+        %zero = arith.constant 0.0 : f32
+        %leftEmpty = arith.cmpf oeq, %leftSum, %zero : f32
+        %rightEmpty = arith.cmpf oeq, %rightSum, %zero : f32
         %maximum = arith.maximumf %leftMaximum, %rightMaximum : f32
         %leftDelta = arith.subf %leftMaximum, %maximum : f32
         %leftScale = math.exp %leftDelta : f32
@@ -19,8 +22,13 @@ func.func @coupled_logsumexp(
         %rightScale = math.exp %rightDelta : f32
         %scaledLeft = arith.mulf %leftScale, %leftSum : f32
         %scaledRight = arith.mulf %rightScale, %rightSum : f32
-        %sum = arith.addf %scaledLeft, %scaledRight : f32
-        linalg.yield %maximum, %sum : f32, f32
+        %mergedSum = arith.addf %scaledLeft, %scaledRight : f32
+        %nonRightMaximum = arith.select %rightEmpty, %leftMaximum, %maximum : f32
+        %nonRightSum = arith.select %rightEmpty, %leftSum, %mergedSum : f32
+        %resultMaximum =
+          arith.select %leftEmpty, %rightMaximum, %nonRightMaximum : f32
+        %resultSum = arith.select %leftEmpty, %rightSum, %nonRightSum : f32
+        linalg.yield %resultMaximum, %resultSum : f32, f32
       }
   return %state#0, %state#1 : tensor<f32>, tensor<f32>
 }
